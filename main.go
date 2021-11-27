@@ -47,7 +47,7 @@ func msdosTimeToGoTime(d uint16, t uint16) time.Time {
 
 var errCentralDirectory = errors.New("central Directory")
 
-func parseEntry(f *os.File) (FileEntry, error) {
+func parseEntry(f *os.File, loadContents bool) (FileEntry, error) {
 	entry := FileEntry{}
 	// read the local file header
 	err := binary.Read(f, binary.LittleEndian, &entry.Header)
@@ -78,13 +78,25 @@ func parseEntry(f *os.File) (FileEntry, error) {
 		return entry, fmt.Errorf("could not skip extrafield: %s", err)
 	}
 
+	if loadContents {
+		err = loadEntryContents(&entry, f)
+		return entry, err
+	} else {
+		_, err = f.Seek(int64(entry.Header.CompressedSize), 1)
+		if err != nil {
+			return entry, fmt.Errorf("could not skip compressed file data: %s", err)
+		}
+	}
+	return entry, err
+}
+
+func loadEntryContents(entry *FileEntry, f *os.File) error {
 	// read the (compressed?) file contents
 	data := make([]byte, entry.Header.CompressedSize)
-	_, err = f.Read(data)
+	_, err := f.Read(data)
 	if err != nil {
-		return entry, err
+		return err
 	}
-
 	if entry.Header.Compression == 0 {
 		entry.Contents = data
 	} else if entry.Header.Compression == 8 {
@@ -92,19 +104,19 @@ func parseEntry(f *os.File) (FileEntry, error) {
 		defer flateReader.Close()
 		read, err := ioutil.ReadAll(flateReader)
 		if err != nil {
-			return entry, fmt.Errorf("error reading compressed data: %s", err)
+			return fmt.Errorf("error reading compressed data: %s", err)
 		}
 		entry.Contents = read
 	} else {
-		return entry, fmt.Errorf("unsupported compression method was found: %d", entry.Header.Compression)
+		return fmt.Errorf("unsupported compression method was found: %d", entry.Header.Compression)
 	}
 
-	return entry, nil
+	return nil
 }
 
 func printData(f *os.File, showContent bool) error {
 	for {
-		entry, err := parseEntry(f)
+		entry, err := parseEntry(f, showContent)
 		if err == errCentralDirectory {
 			break
 		}
