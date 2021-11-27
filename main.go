@@ -47,7 +47,7 @@ func msdosTimeToGoTime(d uint16, t uint16) time.Time {
 
 var errCentralDirectory = errors.New("central Directory")
 
-func parseEntry(f *os.File, loadContents bool) (FileEntry, error) {
+func parseEntry(f *os.File, bLoadContents bool) (FileEntry, error) {
 	entry := FileEntry{}
 	// read the local file header
 	err := binary.Read(f, binary.LittleEndian, &entry.Header)
@@ -78,9 +78,11 @@ func parseEntry(f *os.File, loadContents bool) (FileEntry, error) {
 		return entry, fmt.Errorf("could not skip extrafield: %s", err)
 	}
 
-	if loadContents {
+	if bLoadContents {
 		err = loadEntryContents(&entry, f)
-		return entry, err
+		if err != nil {
+			return entry, fmt.Errorf("could not skip load file data: %s", err)
+		}
 	} else {
 		_, err = f.Seek(int64(entry.Header.CompressedSize), 1)
 		if err != nil {
@@ -114,9 +116,9 @@ func loadEntryContents(entry *FileEntry, f *os.File) error {
 	return nil
 }
 
-func printData(f *os.File, showContent bool) error {
+func printData(f *os.File, bShowContents bool) error {
 	for {
-		entry, err := parseEntry(f, showContent)
+		entry, err := parseEntry(f, bShowContents)
 		if err == errCentralDirectory {
 			break
 		}
@@ -124,7 +126,7 @@ func printData(f *os.File, showContent bool) error {
 			return err
 		}
 		fmt.Printf("%s: %s\n", entry.Modified, entry.Filename)
-		if showContent {
+		if bShowContents {
 			fmt.Print(string(entry.Contents))
 		}
 	}
@@ -133,7 +135,7 @@ func printData(f *os.File, showContent bool) error {
 
 func main() {
 	var in *os.File
-	var bShowContent = flag.Bool("c", false, "Show full file content")
+	var bShowContents = flag.Bool("c", false, "Show full file contents")
 	flag.Parse()
 	if filename := flag.Arg(0); filename != "" {
 		f, err := os.Open(filename)
@@ -146,7 +148,7 @@ func main() {
 	} else {
 		in = os.Stdin
 	}
-	err := printData(in, *bShowContent)
+	err := printData(in, *bShowContents)
 	if err != nil {
 		fmt.Println("Could not parse file: ", err)
 		os.Exit(1)
