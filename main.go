@@ -1,67 +1,37 @@
 package main
 
 import (
-	"os"
 	"bytes"
 	"compress/flate"
-	"io/ioutil"
 	"encoding/binary"
-	"time"
+	"errors"
+	"flag"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"time"
 )
 
-type compression uint8
-const (
-	noCompression compression = iota
-	deflateCompression
-)
-
-type localFileHeader struct {
-	signature uint32
-	version uint16
-	bitFlag uint16
-	compression compression
-	lastModified time.Time
-	crc32 uint32
-	compressedSize uint32
-	uncompressedSize uint32
-	fileName string
-	extraField []byte
-	fileContents string
+// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT (see 4.3.7)
+type LocalFileHeader struct {
+	Signature        uint32
+	Version          uint16
+	BitFlag          uint16
+	Compression      uint16
+	LastModifiedTime uint16
+	LastModifiedDate uint16
+	Crc32            uint32
+	CompressedSize   uint32
+	UncompressedSize uint32
+	FileNameLength   uint16
+	ExtraFieldLength uint16
 }
 
-var errOverranBuffer = fmt.Errorf("Overran buffer")
-
-func readUint32(bs []byte, offset int) (uint32, int, error) {
-	end := offset + 4
-	if end > len(bs) {
-		return 0, 0, errOverranBuffer
-	}
-
-	return binary.LittleEndian.Uint32(bs[offset:end]), end, nil
-}
-
-func readUint16(bs []byte, offset int) (uint16, int, error) {
-	end := offset+2
-	if end > len(bs) {
-		return 0, 0, errOverranBuffer
-	}
-
-	return binary.LittleEndian.Uint16(bs[offset:end]), end, nil
-}
-
-func readBytes(bs []byte, offset int, n int) ([]byte, int, error) {
-	end := offset + n
-	if end > len(bs) {
-		return nil, 0, errOverranBuffer
-	}
-
-	return bs[offset:offset+n], end, nil
-}
-
-func readString(bs []byte, offset int, n int) (string, int, error) {
-	read, end, err := readBytes(bs, offset, n)
-	return string(read), end, err
+type FileEntry struct {
+	Header   LocalFileHeader
+	Filename string
+	Modified time.Time
+	Contents []byte
 }
 
 func msdosTimeToGoTime(d uint16, t uint16) time.Time {
@@ -71,147 +41,102 @@ func msdosTimeToGoTime(d uint16, t uint16) time.Time {
 
 	day := int(d & 0x1F)
 	month := time.Month((d >> 5) & 0x0F)
-	year := int((d >> 9) & 0x7F) + 1980
+	year := int((d>>9)&0x7F) + 1980
 	return time.Date(year, month, day, hours, minutes, seconds, 0, time.Local)
 }
 
+var errCentralDirectory = errors.New("central Directory")
 
-var errNotZip = fmt.Errorf("Not a zip file")
-
-func parseLocalFileHeader(bs []byte, start int) (*localFileHeader, int, error) {
-	signature, i, err := readUint32(bs, start)
-	if signature != 0x04034b50 {
-		return nil, 0, errNotZip
-	}
+func parseEntry(f *os.File) (FileEntry, error) {
+	entry := FileEntry{}
+	// read the local file header
+	err := binary.Read(f, binary.LittleEndian, &entry.Header)
 	if err != nil {
-		return nil, 0, err
+		return entry, fmt.Errorf("could not read local file header length: %s", err)
 	}
 
-	version, i, err := readUint16(bs, i)
+	if entry.Header.Signature == 0x02014b50 {
+		// if we encountered the central directory, this is the end  of the file
+		return entry, errCentralDirectory
+	} else if entry.Header.Signature != 0x04034b50 {
+		// We expected a local file header here.
+		return entry, errors.New("not a zipfile")
+	}
+
+	entry.Modified = msdosTimeToGoTime(entry.Header.LastModifiedDate, entry.Header.LastModifiedTime)
+	// read the filename
+	filename := make([]byte, entry.Header.FileNameLength)
+	_, err = f.Read(filename)
 	if err != nil {
-		return nil, 0, err
+		return entry, fmt.Errorf("could not read file name: %s", err)
 	}
+	entry.Filename = string(filename)
 
-	bitFlag, i, err := readUint16(bs, i)
+	// skip the extrafield
+	_, err = f.Seek(int64(entry.Header.ExtraFieldLength), 1)
 	if err != nil {
-		return nil, 0, err
+		return entry, fmt.Errorf("could not skip extrafield: %s", err)
 	}
 
-	compression := noCompression
-	compressionRaw, i, err := readUint16(bs, i)
+	// read the (compressed?) file contents
+	data := make([]byte, entry.Header.CompressedSize)
+	_, err = f.Read(data)
 	if err != nil {
-		return nil, 0, err
-	}
-	if compressionRaw == 8 {
-		compression = deflateCompression
+		return entry, err
 	}
 
-	lmTime, i, err := readUint16(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	lmDate, i, err := readUint16(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-	lastModified := msdosTimeToGoTime(lmDate, lmTime)
-
-	crc32, i, err := readUint32(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	compressedSize, i, err := readUint32(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	uncompressedSize, i, err := readUint32(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	fileNameLength, i, err := readUint16(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	extraFieldLength, i, err := readUint16(bs, i)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	fileName, i, err := readString(bs, i, int(fileNameLength))
-	if err != nil {
-		return nil, 0, err
-	}
-
-	extraField, i, err := readBytes(bs, i, int(extraFieldLength))
-	if err != nil {
-		return nil, 0, err
-	}
-
-	var fileContents string
-	if compression == noCompression {
-		fileContents, i, err = readString(bs, i, int(uncompressedSize))
-		if err != nil {
-			return nil, 0, err
-		}
-	} else {
-		end := i + int(compressedSize)
-		if end > len(bs) {
-			return nil, 0, errOverranBuffer
-		}
-		flateReader := flate.NewReader(bytes.NewReader(bs[i:end]))
-
+	if entry.Header.Compression == 0 {
+		entry.Contents = data
+	} else if entry.Header.Compression == 8 {
+		flateReader := flate.NewReader(bytes.NewReader(data))
 		defer flateReader.Close()
 		read, err := ioutil.ReadAll(flateReader)
 		if err != nil {
-			return nil, 0, err
+			return entry, fmt.Errorf("error reading compressed data: %s", err)
 		}
-
-		fileContents = string(read)
-
-		i = end
+		entry.Contents = read
+	} else {
+		return entry, fmt.Errorf("unsupported compression method was found: %d", entry.Header.Compression)
 	}
 
-	return &localFileHeader{
-		signature: signature,
-		version: version,
-		bitFlag: bitFlag,
-		compression: compression,
-		lastModified: lastModified,
-		crc32: crc32,
-		compressedSize: compressedSize,
-		uncompressedSize: uncompressedSize,
-		fileName: fileName,
-		extraField: extraField,
-		fileContents: fileContents,
-	}, i, nil
+	return entry, nil
 }
 
-func main() {
-	f, err := ioutil.ReadFile(os.Args[1])
-	if err != nil {
-		panic(err)
-	}
-
-	end := 0
-	for end < len(f) {
-		var err error
-		var lfh *localFileHeader
-		var next int
-		lfh, next, err = parseLocalFileHeader(f, end)
-		if err == errNotZip && end > 0{
+func printData(f *os.File, showContent bool) error {
+	for {
+		entry, err := parseEntry(f)
+		if err == errCentralDirectory {
 			break
 		}
 		if err != nil {
-			panic(err)
+			return err
 		}
+		fmt.Printf("%s: %s\n", entry.Modified, entry.Filename)
+		if showContent {
+			fmt.Print(string(entry.Contents))
+		}
+	}
+	return nil
+}
 
-		end = next
-
-		fmt.Println(lfh.lastModified, lfh.fileName, lfh.fileContents)
+func main() {
+	var in *os.File
+	var bShowContent = flag.Bool("c", false, "Show full file content")
+	flag.Parse()
+	if filename := flag.Arg(0); filename != "" {
+		f, err := os.Open(filename)
+		if err != nil {
+			fmt.Println("Could not open file: ", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		in = f
+	} else {
+		in = os.Stdin
+	}
+	err := printData(in, *bShowContent)
+	if err != nil {
+		fmt.Println("Could not parse file: ", err)
+		os.Exit(1)
 	}
 }
